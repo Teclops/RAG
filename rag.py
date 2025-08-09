@@ -150,7 +150,7 @@ def create_rag_chain(vectorstore: FAISS):
 
         llm = ChatGoogleGenerativeAI(
             api_key="AIzaSyArmeI1xitvuicUDw9vAvQj467yFeBTMWE",
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             temperature=0.0,    # absolutely factual
             max_tokens=1500,    # avoid long rambles
             top_p=0.8
