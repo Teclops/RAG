@@ -9,6 +9,7 @@ uvicorn
 langchain
 langchain-core
 langchain-community
+langchain-nomic
 
 # Google Gemini (PaLM) Integration
 langchain-google-genai
@@ -29,3 +30,7 @@ tqdm
 pypdf
 aiofiles
 aiohttp
+
+
+
+
