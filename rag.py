@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict
 import json
 import time
+import uvicorn
 
 # FastAPI imports
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -27,6 +28,11 @@ from langchain.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from langchain_nomic import NomicEmbeddings
+
+# Set API key (from https://atlas.nomic.ai)
+os.environ["NOMIC_API_KEY"] = "nk-5Kl9IcLShbLzOWhZFZ7Lhe39FEpYTwJnF12OVceGC04"
 
 # ================= FastAPI App Setup =================
 app = FastAPI(
@@ -120,10 +126,8 @@ def create_vectorstore(documents: List) -> FAISS:
         texts = text_splitter.split_documents(documents)
         print(f"[INFO] Created {len(texts)} text chunks")
         
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            task_type="retrieval_document"
-        )
+        # Create embeddings instance
+        embeddings = NomicEmbeddings(model="nomic-embed-text-v1.5")
         
         vectorstore = FAISS.from_documents(texts, embeddings)
         print(f"[INFO] Vectorstore created successfully")
@@ -133,34 +137,56 @@ def create_vectorstore(documents: List) -> FAISS:
         raise HTTPException(status_code=500, detail=f"Failed to create vectorstore: {str(e)}")
 
 def create_rag_chain(vectorstore: FAISS):
-    """Create RAG chain for question answering"""
+    """Create RAG chain for precise, clause-backed insurance QA"""
     try:
         retriever = vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 10, "fetch_k": 20}
+            search_type="mmr",  # Maximal Marginal Relevance for better coverage
+            search_kwargs={
+                "k": 8,          # final chunks passed to LLM (lower for precision)
+                "fetch_k": 30,   # candidates considered
+                "lambda_mult": 0.75  # balance relevance vs diversity
+            }
         )
-        
+
         llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            temperature=0.1,
-            max_tokens=2000,
+            api_key="AIzaSyArmeI1xitvuicUDw9vAvQj467yFeBTMWE",
+            model="gemini-2.5-flash",
+            temperature=0.0,    # absolutely factual
+            max_tokens=1500,    # avoid long rambles
             top_p=0.8
         )
-        
-        prompt_template = """You are an expert insurance policy analyst. Answer the question based ONLY on the provided context from the policy document.
+
+        prompt_template = """You are an expert insurance policy analyst.
+Answer ONLY from the provided policy context — never use outside knowledge.
 
 Context from Policy Document:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Instructions:
-1. Answer based ONLY on the information in the context above
-2. Be specific and include all relevant details (waiting periods, conditions, limits, percentages, etc.)
-3. If the context contains specific numbers, percentages, or time periods, include them exactly
-4. If information is not available in the context, state: "The information is not available in the provided policy document"
-5. Use clear, professional language suitable for insurance domain
-6. Include relevant policy clauses or section references when mentioned in context
+Output Rules:
+1. Format as a **concise 'Policy Breakdown'** with clear bold section headers.
+2. Each main rule: top-level bullet (`-`).
+3. Sub-points: 2-space indent before the dash.
+4. ALWAYS include clause numbers exactly as shown (e.g., "(Clause 13.i)").
+5. Preserve exact figures, dates, durations, percentages.
+6. If not in context, say exactly:
+   "The information is not available in the provided policy document."
+7. Do not repeat the same point in different words.
+8. Language must be professional and precise.
+
+Example Output:
+**Premium Payment in Instalments**
+- Grace Period of 15 days to pay instalment premium (Clause 13.i).
+  - No coverage during grace period (Clause 13.ii).
+  - Continuity benefits maintained if paid within grace period (Clause 13.iii).
+  - No interest charged for late instalments (Clause 13.iv).
+  - Policy cancelled if unpaid after grace period (Clause 13.v).
+
+**Renewal of Policy**
+- Renewable within 30 days to maintain continuity (Clause 10.iv).
+- No coverage during grace period (Clause 10.iv).
 
 Answer:"""
 
@@ -168,7 +194,7 @@ Answer:"""
             template=prompt_template,
             input_variables=["context", "question"]
         )
-        
+
         chain = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -176,38 +202,122 @@ Answer:"""
             return_source_documents=False,
             chain_type_kwargs={"prompt": PROMPT}
         )
-        
+
         print("[INFO] RAG chain created successfully")
         return chain
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create RAG chain: {str(e)}")
 
+import inspect
+
 async def process_questions_with_rag(questions: List[str], rag_chain) -> List[str]:
-    """Process multiple questions using RAG chain"""
+    """Process multiple questions using RAG chain (robust across langchain versions)."""
     answers = []
     total_questions = len(questions)
-    
+
     print(f"[INFO] Processing {total_questions} questions")
-    
+
     for i, question in enumerate(questions, 1):
         try:
             print(f"[INFO] Processing question {i}/{total_questions}: {question[:80]}...")
             start_time = time.time()
-            
-            result = rag_chain.invoke({"query": question})
-            answer = result["result"].strip()
-            
-            processing_time = time.time() - start_time
-            print(f"[INFO] Question {i} processed in {processing_time:.2f}s")
-            answers.append(answer)
-            
+            result = None
+            last_exception = None
+
+            # --- 1) Try async invocation methods if available (prefer these) ---
+            async_names = ["ainvoke", "acall", "arun", "arun_chain", "__acall__"]
+            for name in async_names:
+                if hasattr(rag_chain, name):
+                    method = getattr(rag_chain, name)
+                    if inspect.iscoroutinefunction(method):
+                        try:
+                            # try plain string first
+                            result = await method(question)
+                            break
+                        except Exception as e:
+                            last_exception = e
+                            # try common dict forms
+                            for form in ({"question": question}, {"query": question}):
+                                try:
+                                    result = await method(form)
+                                    break
+                                except Exception as ee:
+                                    last_exception = ee
+                            if result is not None:
+                                break
+
+            # --- 2) If not async-result, run multiple sync attempts in a background thread ---
+            if result is None:
+                def sync_attempts(q):
+                    last_exc = None
+                    attempts = [
+                        lambda x: getattr(rag_chain, "invoke")(x) if hasattr(rag_chain, "invoke") else None,
+                        lambda x: getattr(rag_chain, "invoke")({"question": x}) if hasattr(rag_chain, "invoke") else None,
+                        lambda x: getattr(rag_chain, "invoke")({"query": x}) if hasattr(rag_chain, "invoke") else None,
+                        lambda x: getattr(rag_chain, "run")(x) if hasattr(rag_chain, "run") else None,
+                        lambda x: getattr(rag_chain, "run")({"question": x}) if hasattr(rag_chain, "run") else None,
+                        lambda x: getattr(rag_chain, "run")({"query": x}) if hasattr(rag_chain, "run") else None,
+                        # try direct call forms
+                        lambda x: rag_chain(x) if callable(rag_chain) else None,
+                        lambda x: rag_chain({"question": x}) if callable(rag_chain) else None,
+                        lambda x: rag_chain({"query": x}) if callable(rag_chain) else None,
+                    ]
+
+                    for fn in attempts:
+                        if fn is None:
+                            continue
+                        try:
+                            res = fn(q)
+                            # Some callables may return None or raise; accept any non-None
+                            if res is not None:
+                                return res
+                        except Exception as e:
+                            last_exc = e
+                            continue
+                    # if nothing succeeded, re-raise the last exception for outer handler
+                    if last_exc:
+                        raise last_exc
+                    return None
+
+                try:
+                    result = await asyncio.to_thread(sync_attempts, question)
+                except Exception as e:
+                    last_exception = e
+                    result = None
+
+            # --- 3) Normalize the result into a single string answer ---
+            if isinstance(result, dict):
+                # prefer common keys
+                answer = (
+                    result.get("result")
+                    or result.get("answer")
+                    or result.get("output_text")
+                    or result.get("text")
+                    or (next(iter(result.values())) if len(result) else "")
+                )
+            else:
+                answer = "" if result is None else str(result)
+
+            answer = answer.strip() if isinstance(answer, str) else str(answer).strip()
+
+            if not answer:
+                print(f"[WARNING] No answer produced for question {i}. Last exception: {last_exception}")
+                answers.append("No answer generated.")
+            else:
+                print(f"[DEBUG] LLM Output (question {i}): {answer[:200]}")
+                answers.append(answer)
+
+            print(f"[INFO] Question {i} processed in {time.time() - start_time:.2f}s")
+
         except Exception as e:
-            error_msg = f"Error processing question {i}: {str(e)}"
-            print(f"[ERROR] {error_msg}")
+            print(f"[ERROR] Error processing question {i}: {str(e)}")
+            # keep going; return a per-question failure message (so indices align)
             answers.append("Unable to process this question due to an error.")
-    
+
     return answers
+
+
 
 # ================= API Endpoints =================
 
@@ -226,6 +336,10 @@ async def hackrx_run(request: HackRXRequest, token: str = Depends(verify_token))
         vectorstore = create_vectorstore(documents)
         rag_chain = create_rag_chain(vectorstore)
         answers = await process_questions_with_rag(request.questions, rag_chain)
+
+        for i, (q, a) in enumerate(zip(request.questions, answers), 1):
+            print(f"[RESULT] Q{i}: {q}")
+            print(f"[RESULT] A{i}: {a}")
         
         if len(answers) != len(request.questions):
             raise HTTPException(
@@ -373,7 +487,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.serve:
-        import uvicorn
         print(f"[INFO] Starting HackRX RAG System on {args.host}:{args.port}")
         print(f"[INFO] API Documentation: http://{args.host}:{args.port}/docs")
         print(f"[INFO] Health Check: http://{args.host}:{args.port}/health")
